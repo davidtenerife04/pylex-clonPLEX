@@ -19,16 +19,15 @@ import os
 import json
 import socket
 import threading
-import time
+import re
+import secrets
 import urllib.request
 import urllib.error
 import http.client
 import urllib.parse
 from pathlib import Path
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-import requests
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -47,6 +46,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool
+from PyQt6.QtGui import QImage
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Constantes y helpers
@@ -220,6 +221,10 @@ class Config:
     def save(self):
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(self._d, indent=2), 'utf-8')
+        try:
+            os.chmod(CONFIG_FILE, 0o600)      # contiene el token de sesión
+        except OSError:
+            pass
 
     @property
     def active(self):
@@ -290,16 +295,26 @@ class _LenientHTTPConnection(http.client.HTTPConnection):
     response_class = _LenientHTTPResponse
 
 
+class _LenientHTTPSConnection(http.client.HTTPSConnection):
+    response_class = _LenientHTTPResponse
+
+
+def _new_conn(parsed, timeout: float):
+    """Conexión http o https según el esquema (antes siempre http y puerto 80)."""
+    https = parsed.scheme == 'https'
+    cls   = _LenientHTTPSConnection if https else _LenientHTTPConnection
+    return cls(parsed.hostname, parsed.port or (443 if https else 80), timeout=timeout)
+
+
 def _lenient_request(method: str, url: str, payload: dict | None = None,
                      cookie: str = '', timeout: int = 12,
                      extra_headers: dict | None = None):
     """Petición HTTP tolerante. Devuelve (status, headers_dict, body_bytes)."""
     parsed = urllib.parse.urlparse(url)
-    host   = parsed.hostname
-    port   = parsed.port or 80
     path   = parsed.path or '/'
     if parsed.query:
         path += '?' + parsed.query
+    path   = urllib.parse.quote(path, safe="/?&=%:+,;@~!$'()*")   # tolera tildes/emoji en búsquedas
     body   = json.dumps(payload).encode() if payload is not None else b''
     hdrs   = {
         'Content-Type':   'application/json',
@@ -311,7 +326,7 @@ def _lenient_request(method: str, url: str, payload: dict | None = None,
         hdrs['Cookie'] = f'pylex_session={cookie}'
     if extra_headers:
         hdrs.update(extra_headers)
-    conn = _LenientHTTPConnection(host, port, timeout=timeout)
+    conn = _new_conn(parsed, timeout)
     try:
         conn.request(method, path, body=body or None, headers=hdrs)
         resp   = conn.getresponse()
@@ -326,6 +341,12 @@ def _lenient_request(method: str, url: str, payload: dict | None = None,
 # ══════════════════════════════════════════════════════════════════════════════
 # API Client
 # ══════════════════════════════════════════════════════════════════════════════
+
+class APIError(Exception):
+    def __init__(self, msg: str, status: int = 0):
+        super().__init__(msg)
+        self.status = status
+
 
 class APIClient:
     def __init__(self):
@@ -344,7 +365,7 @@ class APIClient:
                 msg = json.loads(raw).get('error', f'HTTP {status}')
             except Exception:
                 msg = f'HTTP {status}'
-            raise Exception(msg)
+            raise APIError(msg, status)
         return json.loads(raw)
 
     def get(self, path, **_):
@@ -376,24 +397,21 @@ class APIClient:
 # Auth Proxy  (inyecta la cookie en cada petición de streaming)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_PROXY_PATH = re.compile(r'^/([A-Za-z0-9_-]{16,})/((?:stream|thumb)/[0-9a-f]{32})$')
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
-    cfg = {}  # {'server_url': ..., 'token': ...}
+    cfg = {}  # {'server_url': ..., 'token': ..., 'secret': ...}
 
     def do_GET(self):
-        server_url = self.cfg.get('server_url', '').rstrip('/')
-        token      = self.cfg.get('token', '')
-        target     = server_url + self.path
-        print(f'[Proxy] → {target}', flush=True)
-
-        parsed = urllib.parse.urlparse(target)
-        host   = parsed.hostname
-        port   = parsed.port or 80
-        path   = parsed.path or '/'
-        if parsed.query:
-            path += '?' + parsed.query
-
+        m = _PROXY_PATH.fullmatch(urllib.parse.urlparse(self.path).path)
+        if not m or not secrets.compare_digest(m.group(1), self.cfg.get('secret', '')):
+            # Sin esto cualquier proceso/web local podía leer TODA la API con tu sesión
+            self.send_error(404)
+            return
+        parsed = urllib.parse.urlparse(self.cfg.get('server_url', '').rstrip('/') + '/' + m.group(2))
         req_headers = {
-            'Cookie':     f'pylex_session={token}',
+            'Cookie':     f"pylex_session={self.cfg.get('token', '')}",
             'Connection': 'close',
             'User-Agent': f'{APP_NAME}/{APP_VERSION}',
         }
@@ -401,19 +419,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if rh:
             req_headers['Range'] = rh
 
+        conn = None
         try:
-            conn = _LenientHTTPConnection(host, port, timeout=60)
-            conn.request('GET', path, headers=req_headers)
+            conn = _new_conn(parsed, 60)
+            conn.request('GET', parsed.path, headers=req_headers)
             resp = conn.getresponse()
-            print(f'[Proxy] ← {resp.status} {resp.reason} ({target})', flush=True)
-
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() in ('content-type', 'content-length',
                                  'content-range', 'accept-ranges'):
                     self.send_header(k, v)
             self.end_headers()
-
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
@@ -422,48 +438,56 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                 except (BrokenPipeError, ConnectionResetError):
                     break
-            conn.close()
-
         except Exception as e:
-            print(f'[Proxy] ✗ Error: {e} ({target})', flush=True)
-            code = getattr(e, 'code', 502)
+            print(f'[Proxy] ✗ {type(e).__name__}: {e}', flush=True)
             try:
-                self.send_error(code)
+                self.send_error(502)
             except Exception:
                 pass
+        finally:
+            if conn is not None:
+                conn.close()
 
     def log_message(self, *a):
-        pass  # silenciar log HTTP estándar (usamos print arriba)
+        pass
 
 
 class AuthProxy:
+    """Proxy local que inyecta la cookie en las peticiones de streaming de QMediaPlayer.
+    Es multihilo (QMediaPlayer abre varias conexiones Range a la vez; con un servidor
+    monohilo se bloqueaban entre sí) y solo atiende /<secreto>/stream|thumb/<id>."""
+
     def __init__(self):
-        self._srv  = None
-        self._port = 0
+        self._srv    = None
+        self._port   = 0
+        self._secret = secrets.token_urlsafe(16)
 
     @property
     def port(self):
         return self._port
 
+    def _cfg(self, server_url: str, token: str) -> dict:
+        return {'server_url': server_url, 'token': token, 'secret': self._secret}
+
     def start(self, server_url: str, token: str):
         self.stop()
-        _ProxyHandler.cfg = {'server_url': server_url, 'token': token}
-        s = socket.socket(); s.bind(('', 0)); self._port = s.getsockname()[1]; s.close()
-        self._srv = HTTPServer(('127.0.0.1', self._port), _ProxyHandler)
-        t = threading.Thread(target=self._srv.serve_forever, daemon=True, name='PyLexProxy')
-        t.start()
+        _ProxyHandler.cfg = self._cfg(server_url, token)
+        self._srv  = ThreadingHTTPServer(('127.0.0.1', 0), _ProxyHandler)   # puerto 0: sin carrera
+        self._port = self._srv.server_address[1]
+        threading.Thread(target=self._srv.serve_forever, daemon=True, name='PyLexProxy').start()
 
     def update(self, server_url: str, token: str):
-        _ProxyHandler.cfg = {'server_url': server_url, 'token': token}
+        _ProxyHandler.cfg = self._cfg(server_url, token)
 
     def stop(self):
         if self._srv:
             self._srv.shutdown()
+            self._srv.server_close()
             self._srv  = None
             self._port = 0
 
     def stream_url(self, mid: str) -> str:
-        return f'http://127.0.0.1:{self._port}/stream/{mid}'
+        return f'http://127.0.0.1:{self._port}/{self._secret}/stream/{mid}'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -495,35 +519,76 @@ _TW_CONTAINER: 'QObject | None' = None
 def _tw_container() -> 'QObject':
     global _TW_CONTAINER
     if _TW_CONTAINER is None:
-        from PyQt6.QtCore import QObject as _QObject
-        _TW_CONTAINER = _QObject()
+        _TW_CONTAINER = QObject()
     return _TW_CONTAINER
 
 
-class ThumbWorker(QThread):
-    done = pyqtSignal(str, QPixmap)
+_THUMB_CACHE: dict = {}
+_THUMB_CACHE_MAX = 600
+_THUMB_POOL = None
 
-    def __init__(self, api: APIClient, mid: str):
-        # El contenedor es el padre Qt → Qt gestiona el ciclo de vida C++
-        super().__init__(_tw_container())
-        self._api = api
-        self._mid = mid
-        self.setTerminationEnabled(True)
-        # deleteLater programa la destrucción C++ para el siguiente ciclo del
-        # event loop, momento en que el hilo del OS ya habrá salido del todo.
-        self.finished.connect(self.deleteLater)
+
+def _thumb_pool() -> QThreadPool:
+    """Máx. 6 descargas simultáneas (antes: un QThread por tarjeta → cientos de hilos y
+    cientos de peticiones concurrentes al servidor, que generaba miniaturas con ffmpeg)."""
+    global _THUMB_POOL
+    if _THUMB_POOL is None:
+        _THUMB_POOL = QThreadPool()
+        _THUMB_POOL.setMaxThreadCount(6)
+    return _THUMB_POOL
+
+
+class _ThumbTask(QRunnable):
+    def __init__(self, owner: 'ThumbWorker'):
+        super().__init__()
+        self._o = owner
 
     def run(self):
-        if self.isInterruptionRequested():
+        o = self._o
+        try:
+            if o._cancel:
+                return
+            data = o._api.thumb_bytes(o._mid)
+            if o._cancel or not data:
+                return
+            img = QImage()           # QImage sí es seguro fuera del hilo GUI; QPixmap no
+            if img.loadFromData(data) and not img.isNull():
+                o._img.emit(o._mid, img)
+        finally:
+            o._fin.emit()
+
+
+class ThumbWorker(QObject):
+    """Misma interfaz que antes (done / start / requestInterruption), sin un hilo por miniatura."""
+    done = pyqtSignal(str, QPixmap)
+    _img = pyqtSignal(str, QImage)
+    _fin = pyqtSignal()
+
+    def __init__(self, api: APIClient, mid: str):
+        super().__init__(_tw_container())     # el contenedor mantiene vivo el objeto C++
+        self._api, self._mid, self._cancel = api, mid, False
+        self._img.connect(self._on_img)       # emitida desde el pool → se ejecuta en el hilo GUI
+        self._fin.connect(self.deleteLater)
+
+    def requestInterruption(self):
+        self._cancel = True
+
+    def start(self):
+        px = _THUMB_CACHE.get(self._mid)
+        if px is not None:
+            self.done.emit(self._mid, px)
+            self.deleteLater()
             return
-        data = self._api.thumb_bytes(self._mid)
-        if self.isInterruptionRequested():
+        _thumb_pool().start(_ThumbTask(self))
+
+    def _on_img(self, mid: str, img: QImage):
+        if self._cancel:
             return
-        if data:
-            px = QPixmap()
-            px.loadFromData(data)
-            if not px.isNull() and not self.isInterruptionRequested():
-                self.done.emit(self._mid, px)
+        px = QPixmap.fromImage(img)           # conversión en el hilo GUI
+        if len(_THUMB_CACHE) >= _THUMB_CACHE_MAX:
+            _THUMB_CACHE.pop(next(iter(_THUMB_CACHE)))
+        _THUMB_CACHE[mid] = px
+        self.done.emit(mid, px)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -739,12 +804,14 @@ class ListRow(QFrame):
 class _ImageLoadWorker(QThread):
     done      = pyqtSignal(QPixmap)
     error_msg = pyqtSignal(str)
+    _img      = pyqtSignal(QImage)
 
     def __init__(self, proxy: 'AuthProxy', mid: str):
         super().__init__()
         self._proxy = proxy
         self._mid   = mid
         self.setTerminationEnabled(True)
+        self._img.connect(lambda im: self.done.emit(QPixmap.fromImage(im)))
 
     def run(self):
         try:
@@ -756,9 +823,9 @@ class _ImageLoadWorker(QThread):
                 data = r.read()
             if self.isInterruptionRequested():
                 return
-            px = QPixmap()
-            if data and px.loadFromData(data) and not px.isNull():
-                self.done.emit(px)
+            img = QImage()
+            if data and img.loadFromData(data) and not img.isNull():
+                self._img.emit(img)
             else:
                 self.error_msg.emit('Formato de imagen no compatible')
         except Exception as exc:
@@ -1095,6 +1162,11 @@ class PlayerBar(QFrame):
         self._connect()
         self.hide()
 
+        self._save_timer = QTimer(self)
+        self._save_timer.setInterval(15000)
+        self._save_timer.timeout.connect(self._tick_save)
+        self._save_timer.start()
+
     def _build(self):
         row = QHBoxLayout(self)
         row.setContentsMargins(16, 0, 16, 0)
@@ -1280,8 +1352,18 @@ class PlayerBar(QFrame):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self._btn_play.setText('⏸' if playing else '▶')
 
+    def _tick_save(self):
+        """Cada 15 s con reproducción activa: guarda progreso/posición en el servidor."""
+        if (self._current and self._current.get('type') in ('audio', 'video')
+                and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+            dur = self._player.duration()
+            pos = self._player.position()
+            if dur > 0:
+                self._save_progress(min(1.0, pos / dur), pos / 1000)
+
     def _on_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._save_progress(1.0, 0)      # terminado → "no continuar"
             self._next()
 
     def _on_vol(self, val: int):
@@ -1377,6 +1459,7 @@ class ContentView(QScrollArea):
         self._main_lay.addStretch()
 
     def clear(self):
+        _thumb_pool().clear()     # descarta miniaturas pendientes de la vista anterior
         while self._main_lay.count() > 1:   # keep the trailing stretch
             item = self._main_lay.takeAt(0)
             if item.widget():
@@ -2022,7 +2105,7 @@ class MainWindow(QMainWindow):
         self._content.show_loading()
         self._run(
             lambda: self._api.get(
-                f'/api/libraries/{lid}/media?sort={s}&limit=200'
+                f'/api/libraries/{lid}/media?sort={urllib.parse.quote(str(s))}&limit=200'
             ),
             lambda d: self._content.show_media(d.get('media', []))
         )
@@ -2035,7 +2118,7 @@ class MainWindow(QMainWindow):
         self._sidebar.set_active('search')
         self._content.show_loading()
         self._run(
-            lambda: self._api.get(f'/api/media?q={q}&limit=200'),
+            lambda: self._api.get(f'/api/media?q={urllib.parse.quote(q)}&limit=200'),
             lambda d: self._content.show_media(
                 d.get('media', []),
                 title=f'{len(d.get("media", []))} resultados'
@@ -2091,7 +2174,7 @@ class MainWindow(QMainWindow):
             if media.get('library_id'):
                 data = self._api.get(
                     f'/api/libraries/{media["library_id"]}/media'
-                    f'?type={media["type"]}&limit=200&sort={self._sort}'
+                    f'?type={media["type"]}&limit=200&sort={urllib.parse.quote(str(self._sort))}'
                 )
                 siblings = data.get('media', [])
             else:
@@ -2183,8 +2266,8 @@ class MainWindow(QMainWindow):
                 pass
             self._cfg.logout()
             self._player.stop_and_hide()
-            self.close()
             _start_login(self._api, self._proxy, self._cfg, QApplication.instance())
+            self.close()
 
     # ── Worker helper ──────────────────────────────────────────────────────────
 
@@ -2219,6 +2302,8 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         self._workers.clear()
+        _thumb_pool().clear()
+        _thumb_pool().waitForDone(1500)
         self._proxy.stop()
         super().closeEvent(e)
 
@@ -2260,12 +2345,7 @@ def main():
         except Exception:
             pass
 
-    # High-DPI
-    try:
-        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
-    except AttributeError:
-    # El atributo no existe en Qt 6, se ignora silenciosamente
-     pass
+    # Qt 6 ya escala en High-DPI por defecto; no hace falta AA_UseHighDpiPixmaps
 
     cfg   = Config()
     api   = APIClient()
@@ -2280,11 +2360,11 @@ def main():
         def _check():
             try:
                 data = api.get('/api/me')
-                if data.get('ok'):
-                    return data
-            except Exception:
-                pass
-            return None
+                return data if data.get('ok') else None
+            except APIError as e:
+                if e.status in (401, 403):      # sesión realmente caducada/revocada
+                    return None
+                raise                            # error de servidor/red: conservar el token
 
         w = Worker(_check)
         app._w = w

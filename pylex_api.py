@@ -34,7 +34,7 @@ USUARIO ACTUAL
 SESIONES
   GET   /api/sessions            Sesiones activas del usuario actual
   DELETE /api/sessions           Cerrar todas las sesiones
-  DELETE /api/sessions/<token>   Cerrar una sesión concreta
+  DELETE /api/sessions/<id>      Cerrar una sesión concreta (id de GET /api/sessions)
 
 BIBLIOTECAS
   GET   /api/libraries           Listar todas las bibliotecas
@@ -88,12 +88,35 @@ import re
 import json
 import os
 import sys
-from datetime import datetime
+import threading
+import importlib
 from urllib.parse import urlparse, parse_qs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers internos
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _px():
+    """Devuelve el módulo del servidor, se llame pylex.py o pylexv2.py, y reutiliza la
+    instancia ya cargada (incluido __main__) en vez de importar una segunda copia."""
+    for name in ('pylex', 'pylexv2', '__main__'):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, 'PyLexHandler'):
+            return mod
+    for name in ('pylex', 'pylexv2'):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise ImportError("No se encuentra el servidor (pylex.py / pylexv2.py) junto a pylex_api.py")
+
+
+def _scrub(item: dict, user: dict) -> dict:
+    """Los usuarios no-admin no deben ver rutas del sistema de ficheros del servidor."""
+    if user.get('role') != 'admin':
+        item.pop('path', None)
+    return item
+
 
 def _row(r):
     """Convierte sqlite3.Row en dict serializable."""
@@ -148,22 +171,20 @@ def _media_url(media_id: str) -> dict:
 
 def api_login(handler):
     """POST /api/login  { username, password, remember? }"""
-    import pylex as px
+    px = _px()
     body = handler.read_json()
-    un   = body.get('username', '').strip().lower()
-    pw   = body.get('password', '')
+    un   = str(body.get('username', '')).strip().lower()
+    pw   = str(body.get('password', ''))
     if not un or not pw:
         handler.send_json({'ok': False, 'error': 'Faltan credenciales'}, 400)
         return
-    db = px.get_db()
-    u  = db.execute("SELECT * FROM users WHERE username=?", (un,)).fetchone()
-    db.close()
-    if not u or not px.verify_password(pw, u['pw_hash'], u['pw_salt']):
-        handler.send_json({'ok': False, 'error': 'Credenciales incorrectas'}, 401)
+    u, err, status = px.authenticate(un, pw, handler.get_ip())
+    if err:
+        handler.send_json({'ok': False, 'error': err}, status)
         return
     days  = px.SESSION_DAYS if body.get('remember') else 1
     token = px.create_session(u['id'], handler.get_ip(),
-                              handler.headers.get('User-Agent', ''))
+                              handler.headers.get('User-Agent', ''), days)
     payload = json.dumps({
         'ok': True,
         'token': token,
@@ -185,7 +206,7 @@ def api_login(handler):
 
 def api_logout(handler):
     """POST /api/logout"""
-    import pylex as px
+    px = _px()
     token = handler.get_token()
     if token:
         px.revoke_session(token)
@@ -200,7 +221,7 @@ def api_logout(handler):
 
 def api_setup(handler):
     """POST /api/setup  { username, display, password }"""
-    import pylex as px
+    px = _px()
     import sqlite3
     if not px.needs_setup():
         handler.send_json({'ok': False, 'error': 'Ya configurado'}, 400)
@@ -239,7 +260,7 @@ def api_setup(handler):
 
 def api_me_get(handler, user: dict):
     """GET /api/me"""
-    import pylex as px
+    px = _px()
     db = px.get_db()
     play_count = db.execute(
         "SELECT COUNT(*) FROM activity_log WHERE user_id=?", (user['id'],)
@@ -272,7 +293,7 @@ def api_me_get(handler, user: dict):
 
 def api_me_post(handler, user: dict):
     """POST /api/me  { display?, avatar? }"""
-    import pylex as px
+    px = _px()
     body = handler.read_json()
     dis  = body.get('display', '').strip()
     av   = body.get('avatar',  '').strip()
@@ -289,7 +310,7 @@ def api_me_post(handler, user: dict):
 
 def api_me_password(handler, user: dict):
     """POST /api/me/password  { old_password, new_password }"""
-    import pylex as px
+    px = _px()
     body = handler.read_json()
     old  = body.get('old_password', '')
     new  = body.get('new_password', '')
@@ -314,23 +335,25 @@ def api_me_password(handler, user: dict):
 
 def api_sessions_get(handler, user: dict):
     """GET /api/sessions"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     rows = _rows(db.execute(
         "SELECT token, created_at, expires_at, ip, ua FROM sessions WHERE user_id=? ORDER BY created_at DESC",
         (user['id'],)
     ).fetchall())
     db.close()
-    # Ocultar token completo por seguridad; exponer sólo un preview
+    # El token real no sale nunca: se expone un id público (sirve para DELETE /api/sessions/<id>)
+    current = handler.get_token()
     for r in rows:
-        r['token_preview'] = r['token'][:8] + '…'
+        r['id']      = px.session_sid(r['token'])
+        r['current'] = (r['token'] == current)
         del r['token']
     handler.send_json({'ok': True, 'sessions': rows})
 
 
 def api_sessions_delete_all(handler, user: dict):
     """DELETE /api/sessions"""
-    import pylex as px
+    px = _px()
     db = px.get_db()
     db.execute("DELETE FROM sessions WHERE user_id=?", (user['id'],))
     db.commit()
@@ -339,13 +362,9 @@ def api_sessions_delete_all(handler, user: dict):
 
 
 def api_session_delete(handler, user: dict, token: str):
-    """DELETE /api/sessions/<token>"""
-    import pylex as px
-    db = px.get_db()
-    s  = db.execute("SELECT user_id FROM sessions WHERE token=?", (token,)).fetchone()
-    db.close()
-    if s and s['user_id'] == user['id']:
-        px.revoke_session(token)
+    """DELETE /api/sessions/<id>   (id = campo id de GET /api/sessions)"""
+    px = _px()
+    if px.revoke_session_by_sid(user['id'], token):
         handler.send_json({'ok': True})
     else:
         handler.send_json({'ok': False, 'error': 'No autorizado'}, 403)
@@ -355,7 +374,7 @@ def api_session_delete(handler, user: dict, token: str):
 
 def api_libraries_get(handler, user: dict):
     """GET /api/libraries"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     libs = _rows(db.execute("""
         SELECT l.id, l.name, l.path, l.type, l.last_scan, l.created_at,
@@ -367,12 +386,14 @@ def api_libraries_get(handler, user: dict):
         ORDER BY l.name COLLATE NOCASE
     """).fetchall())
     db.close()
+    for lb in libs:
+        _scrub(lb, user)
     handler.send_json({'ok': True, 'libraries': libs})
 
 
 def api_library_get(handler, user: dict, lib_id: int):
     """GET /api/libraries/<id>"""
-    import pylex as px
+    px = _px()
     db  = px.get_db()
     lib = _row(db.execute("""
         SELECT l.id, l.name, l.path, l.type, l.last_scan, l.created_at,
@@ -387,12 +408,12 @@ def api_library_get(handler, user: dict, lib_id: int):
     if not lib:
         handler.send_json({'ok': False, 'error': 'Biblioteca no encontrada'}, 404)
         return
-    handler.send_json({'ok': True, 'library': lib})
+    handler.send_json({'ok': True, 'library': _scrub(lib, user)})
 
 
 def api_library_media(handler, user: dict, lib_id: int, qs: dict):
     """GET /api/libraries/<id>/media"""
-    import pylex as px
+    px = _px()
     page, limit, offset = _page_params(qs)
     sort   = _sort_clause(qs)
     ftype  = qs.get('type', [''])[0]
@@ -419,6 +440,7 @@ def api_library_media(handler, user: dict, lib_id: int, qs: dict):
 
     for item in items:
         item.update(_media_url(item['id']))
+        _scrub(item, user)
 
     handler.send_json({
         'ok': True,
@@ -431,7 +453,7 @@ def api_library_media(handler, user: dict, lib_id: int, qs: dict):
 
 def api_library_create(handler, user: dict):
     """POST /api/libraries  { name, path, type }"""
-    import pylex as px
+    px = _px()
     body  = handler.read_json()
     name  = body.get('name', '').strip()
     fpath = body.get('path', '').strip()
@@ -439,9 +461,12 @@ def api_library_create(handler, user: dict):
     if not name or not fpath:
         handler.send_json({'ok': False, 'error': 'name y path son obligatorios'}, 400)
         return
-    if not os.path.isdir(fpath):
-        handler.send_json({'ok': False, 'error': f'El directorio no existe: {fpath}'}, 400)
+    fpath, perr = px.check_library_path(fpath)     # misma validación que la interfaz web
+    if perr:
+        handler.send_json({'ok': False, 'error': perr}, 400)
         return
+    if ltype not in ('movies', 'shows', 'music', 'photos', 'other'):
+        ltype = 'other'
     db = px.get_db()
     cur = db.execute(
         "INSERT INTO libraries(name,path,type,created_by) VALUES(?,?,?,?)",
@@ -450,18 +475,20 @@ def api_library_create(handler, user: dict):
     lib_id = cur.lastrowid
     db.commit()
     db.close()
-    handler.send_json({'ok': True, 'library_id': lib_id})
+    threading.Thread(target=px.scan_library, args=(lib_id, fpath, ltype), daemon=True).start()
+    handler.send_json({'ok': True, 'library_id': lib_id, 'scanning': True})
 
 
 def api_library_delete(handler, user: dict, lib_id: int):
     """DELETE /api/libraries/<id>"""
-    import pylex as px
+    px = _px()
     db = px.get_db()
     lib = db.execute("SELECT id FROM libraries WHERE id=?", (lib_id,)).fetchone()
     if not lib:
         db.close()
         handler.send_json({'ok': False, 'error': 'Biblioteca no encontrada'}, 404)
         return
+    db.execute("DELETE FROM activity_log WHERE media_id IN (SELECT id FROM media WHERE library_id=?)", (lib_id,))
     db.execute("DELETE FROM media WHERE library_id=?", (lib_id,))
     db.execute("DELETE FROM libraries WHERE id=?", (lib_id,))
     db.commit()
@@ -471,7 +498,7 @@ def api_library_delete(handler, user: dict, lib_id: int):
 
 def api_library_scan(handler, user: dict, lib_id: int):
     """POST /api/libraries/<id>/scan"""
-    import pylex as px
+    px = _px()
     import threading
     db  = px.get_db()
     lib = _row(db.execute("SELECT * FROM libraries WHERE id=?", (lib_id,)).fetchone())
@@ -520,7 +547,7 @@ def _build_media_query(qs: dict):
 
 def api_media_list(handler, user: dict, qs: dict):
     """GET /api/media  (también usado por /api/search)"""
-    import pylex as px
+    px = _px()
     page, limit, offset = _page_params(qs)
     sort  = _sort_clause(qs)
     where, params = _build_media_query(qs)
@@ -535,6 +562,7 @@ def api_media_list(handler, user: dict, qs: dict):
 
     for item in items:
         item.update(_media_url(item['id']))
+        _scrub(item, user)
 
     handler.send_json({
         'ok': True,
@@ -546,7 +574,7 @@ def api_media_list(handler, user: dict, qs: dict):
 
 def api_media_detail(handler, user: dict, media_id: str):
     """GET /api/media/<id>"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     item = _row(db.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone())
     db.close()
@@ -554,12 +582,13 @@ def api_media_detail(handler, user: dict, media_id: str):
         handler.send_json({'ok': False, 'error': 'No encontrado'}, 404)
         return
     item.update(_media_url(media_id))
+    _scrub(item, user)
     handler.send_json({'ok': True, 'media': item})
 
 
 def api_media_related(handler, user: dict, media_id: str):
     """GET /api/media/<id>/related"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     item = _row(db.execute("SELECT library_id, type FROM media WHERE id=?", (media_id,)).fetchone())
     if not item:
@@ -584,40 +613,20 @@ def api_media_related(handler, user: dict, media_id: str):
 
 def api_media_play(handler, user: dict, media_id: str):
     """POST /api/media/<id>/play  { progress?, position? }"""
-    import pylex as px
-    body     = handler.read_json()
-    progress = body.get('progress')
-    position = body.get('position')
-    db       = px.get_db()
-    item     = db.execute("SELECT id FROM media WHERE id=?", (media_id,)).fetchone()
-    if not item:
-        db.close()
-        handler.send_json({'ok': False, 'error': 'No encontrado'}, 404)
-        return
-    if progress is not None:
-        db.execute(
-            "UPDATE media SET play_count=play_count+1, last_played=?, progress=?, position=? WHERE id=?",
-            (datetime.now().isoformat(), float(progress), float(position or 0), media_id)
-        )
+    px   = _px()
+    body = handler.read_json()
+    ok, err = px.record_play(user['id'], media_id, body.get('progress'), body.get('position'))
+    if ok:
+        handler.send_json({'ok': True})
     else:
-        db.execute(
-            "UPDATE media SET play_count=play_count+1, last_played=? WHERE id=?",
-            (datetime.now().isoformat(), media_id)
-        )
-    db.execute(
-        "INSERT INTO activity_log(user_id, media_id, action) VALUES(?,?,?)",
-        (user['id'], media_id, 'play')
-    )
-    db.commit()
-    db.close()
-    handler.send_json({'ok': True})
+        handler.send_json({'ok': False, 'error': err}, 404 if err == 'No encontrado' else 400)
 
 
 # ── UTILIDADES ─────────────────────────────────────────────────────────────────
 
 def api_continue(handler, user: dict, qs: dict):
     """GET /api/continue  — Items con progreso parcial del usuario actual"""
-    import pylex as px
+    px = _px()
     page, limit, offset = _page_params(qs)
     db    = px.get_db()
     total = db.execute(
@@ -633,6 +642,7 @@ def api_continue(handler, user: dict, qs: dict):
     db.close()
     for item in items:
         item.update(_media_url(item['id']))
+        _scrub(item, user)
     handler.send_json({
         'ok': True,
         'pagination': {'page': page, 'limit': limit, 'total': total,
@@ -643,7 +653,7 @@ def api_continue(handler, user: dict, qs: dict):
 
 def api_stats(handler, user: dict):
     """GET /api/stats"""
-    import pylex as px
+    px = _px()
     db = px.get_db()
 
     counts = _row(db.execute("""
@@ -688,7 +698,7 @@ def api_stats(handler, user: dict):
 
 def api_activity_get(handler, user: dict, qs: dict):
     """GET /api/activity  [admin]"""
-    import pylex as px
+    px = _px()
     page, limit, offset = _page_params(qs)
     db    = px.get_db()
     total = db.execute("SELECT COUNT(*) FROM activity_log").fetchone()[0]
@@ -718,7 +728,7 @@ def api_activity_get(handler, user: dict, qs: dict):
 
 def api_users_get(handler, user: dict):
     """GET /api/users  [admin]"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     rows = _rows(db.execute(
         "SELECT id, username, display, role, avatar, created_at, last_login FROM users ORDER BY created_at"
@@ -729,7 +739,7 @@ def api_users_get(handler, user: dict):
 
 def api_users_create(handler, user: dict):
     """POST /api/users  { username, display, password, role?, avatar? }  [admin]"""
-    import pylex as px
+    px = _px()
     import sqlite3
     body = handler.read_json()
     un   = body.get('username', '').strip().lower()
@@ -761,7 +771,7 @@ def api_users_create(handler, user: dict):
 
 def api_user_delete(handler, user: dict, uid: int):
     """DELETE /api/users/<id>  [admin]"""
-    import pylex as px
+    px = _px()
     if uid == user['id']:
         handler.send_json({'ok': False, 'error': 'No puedes eliminarte a ti mismo'}, 400)
         return
@@ -772,6 +782,7 @@ def api_user_delete(handler, user: dict, uid: int):
         handler.send_json({'ok': False, 'error': 'Usuario no encontrado'}, 404)
         return
     db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    db.execute("DELETE FROM activity_log WHERE user_id=?", (uid,))
     db.execute("DELETE FROM users WHERE id=?", (uid,))
     db.commit()
     db.close()
@@ -780,7 +791,7 @@ def api_user_delete(handler, user: dict, uid: int):
 
 def api_user_role(handler, user: dict, uid: int):
     """POST /api/users/<id>/role  { role }  [admin]"""
-    import pylex as px
+    px = _px()
     if uid == user['id']:
         handler.send_json({'ok': False, 'error': 'No puedes cambiar tu propio rol'}, 400)
         return
@@ -800,7 +811,7 @@ def api_user_role(handler, user: dict, uid: int):
 
 def api_settings_get(handler, user: dict):
     """GET /api/settings  [admin]"""
-    import pylex as px
+    px = _px()
     db   = px.get_db()
     rows = db.execute("SELECT key, value FROM settings").fetchall()
     db.close()
@@ -810,13 +821,17 @@ def api_settings_get(handler, user: dict):
 
 def api_settings_post(handler, user: dict):
     """POST /api/settings  { server_name?, auto_scan_hours? }  [admin]"""
-    import pylex as px
+    px = _px()
     body = handler.read_json()
     db   = px.get_db()
     allowed = ('server_name', 'auto_scan_hours')
     updated = {}
     for key in allowed:
-        val = body.get(key, '').strip()
+        val = str(body.get(key, '')).strip()
+        if key == 'auto_scan_hours' and val and (not val.isdigit() or not 0 <= int(val) <= 168):
+            db.close()
+            handler.send_json({'ok': False, 'error': 'auto_scan_hours debe ser 0-168'}, 400)
+            return
         if val:
             db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, val))
             updated[key] = val
@@ -829,7 +844,7 @@ def api_settings_post(handler, user: dict):
 
 def api_debug(handler, user: dict):
     """GET /api/debug  [admin]"""
-    import pylex as px
+    px = _px()
     db        = px.get_db()
     lib_cols  = [r[1] for r in db.execute("PRAGMA table_info(libraries)").fetchall()]
     med_cols  = [r[1] for r in db.execute("PRAGMA table_info(media)").fetchall()]
@@ -904,8 +919,6 @@ _DELETE_ROUTES = [
 
 def _dispatch_get(handler, path: str, qs: dict) -> bool:
     """Intenta despachar un GET de API. Devuelve True si fue manejado."""
-    import pylex as px
-
     for pattern, action in _GET_ROUTES:
         m = re.match(pattern, path)
         if not m:
@@ -966,8 +979,6 @@ def _dispatch_get(handler, path: str, qs: dict) -> bool:
 
 def _dispatch_post(handler, path: str) -> bool:
     """Intenta despachar un POST de API. Devuelve True si fue manejado."""
-    import pylex as px
-
     for pattern, action in _POST_ROUTES:
         m = re.match(pattern, path)
         if not m:
@@ -1029,8 +1040,6 @@ def _dispatch_post(handler, path: str) -> bool:
 
 def _dispatch_delete(handler, path: str) -> bool:
     """Intenta despachar un DELETE de API. Devuelve True si fue manejado."""
-    import pylex as px
-
     for pattern, action in _DELETE_ROUTES:
         m = re.match(pattern, path)
         if not m:
@@ -1065,22 +1074,37 @@ def _dispatch_delete(handler, path: str) -> bool:
 # CORS helper  (útil para SPA en desarrollo en otro puerto)
 # ──────────────────────────────────────────────────────────────────────────────
 
-CORS_ORIGINS = os.environ.get('PYLEX_CORS_ORIGINS', '').split(',')
+# Lista explícita de orígenes permitidos (separados por comas). Vacía = CORS desactivado.
+# No se admite '*' porque las cookies/credenciales + '*' permitirían a cualquier web leer tu API.
+CORS_ORIGINS = [o.strip() for o in os.environ.get('PYLEX_CORS_ORIGINS', '').split(',')
+                if o.strip() and o.strip() != '*']
+
+
+def _cors_origin(handler):
+    origin = handler.headers.get('Origin', '')
+    return origin if origin and origin in CORS_ORIGINS else None
 
 
 def _add_cors_headers(handler):
-    origin = handler.headers.get('Origin', '')
-    if not CORS_ORIGINS or origin in CORS_ORIGINS or '*' in CORS_ORIGINS:
-        handler.send_header('Access-Control-Allow-Origin', origin or '*')
-        handler.send_header('Access-Control-Allow-Credentials', 'true')
-        handler.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-        handler.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    """Solo marca el origen permitido. Las cabeceras se emiten en end_headers(), es decir,
+    DESPUÉS de la línea de estado (antes salían antes de 'HTTP/1.0 200 OK' y rompían la
+    respuesta para cualquier cliente sin cabecera Origin)."""
+    handler._cors_origin = _cors_origin(handler)
 
 
 def _handle_options(handler, path: str):
     """Responde a preflight CORS."""
+    origin = _cors_origin(handler)
+    handler._cors_origin = None
     handler.send_response(204)
-    _add_cors_headers(handler)
+    if origin:
+        handler.send_header('Access-Control-Allow-Origin', origin)
+        handler.send_header('Access-Control-Allow-Credentials', 'true')
+        handler.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+        handler.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        handler.send_header('Access-Control-Max-Age', '600')
+        handler.send_header('Vary', 'Origin')
+    handler.send_header('Content-Length', '0')
     handler.end_headers()
 
 
@@ -1098,9 +1122,28 @@ def patch(HandlerClass):
         import pylex_api
         pylex_api.patch(PyLexHandler)
     """
+    if getattr(HandlerClass, '_pylex_api_patched', False):
+        return
     _orig_get    = HandlerClass.do_GET
     _orig_post   = HandlerClass.do_POST
     _orig_delete = HandlerClass.do_DELETE
+    _orig_end    = HandlerClass.end_headers
+    _orig_token  = HandlerClass.get_token
+
+    def end_headers(self):
+        origin = getattr(self, '_cors_origin', None)
+        if origin:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Access-Control-Allow-Credentials', 'true')
+            self.send_header('Vary', 'Origin')
+        _orig_end(self)
+
+    def get_token(self):
+        """Acepta 'Authorization: Bearer <token>' además de la cookie (el login ya devolvía el token)."""
+        auth = self.headers.get('Authorization', '')
+        if auth[:7].lower() == 'bearer ':
+            return auth[7:].strip()
+        return _orig_token(self)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1150,6 +1193,9 @@ def patch(HandlerClass):
         parsed = urlparse(self.path)
         _handle_options(self, parsed.path)
 
+    HandlerClass.end_headers = end_headers
+    HandlerClass.get_token  = get_token
+    HandlerClass._pylex_api_patched = True
     HandlerClass.do_GET    = do_GET
     HandlerClass.do_POST   = do_POST
     HandlerClass.do_DELETE = do_DELETE
@@ -1164,7 +1210,7 @@ def patch(HandlerClass):
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    # Importamos pylex y lo parcheamos antes de que arranque su main()
-    import pylex
-    patch(pylex.PyLexHandler)
-    pylex.main()
+    # Importamos el servidor (pylex.py o pylexv2.py) y lo parcheamos antes de su main()
+    _srv = _px()
+    patch(_srv.PyLexHandler)
+    _srv.main()

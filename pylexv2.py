@@ -22,10 +22,13 @@ import sqlite3
 import socket
 import ipaddress
 import logging
+import math
+import string
+import socketserver
 from pathlib import Path
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote, quote
+from urllib.parse import urlparse, parse_qs, quote
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
@@ -158,14 +161,22 @@ def init_db():
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")   # WAL ya es persistente (se fija en init_db)
     return conn
 
+_SETUP_DONE = False
+
 def needs_setup() -> bool:
+    global _SETUP_DONE
+    if _SETUP_DONE:                      # una vez creado el admin ya no se vuelve a consultar
+        return False
     db = get_db()
     row = db.execute("SELECT COUNT(*) as n FROM users WHERE role='admin'").fetchone()
     db.close()
-    return row['n'] == 0
+    need = row['n'] == 0
+    if not need:
+        _SETUP_DONE = True
+    return need
 
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
@@ -179,10 +190,11 @@ def verify_password(password: str, pw_hash: str, pw_salt: str) -> bool:
     h, _ = hash_password(password, pw_salt)
     return hmac.compare_digest(h, pw_hash)
 
-def create_session(user_id: int, ip: str, ua: str) -> str:
+def create_session(user_id: int, ip: str, ua: str, days: int = SESSION_DAYS) -> str:
     token = secrets.token_hex(32)
-    expires = (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat()
+    expires = (datetime.now() + timedelta(days=days)).isoformat()
     db = get_db()
+    db.execute("DELETE FROM sessions WHERE expires_at < ?", (datetime.now().isoformat(),))
     db.execute("INSERT INTO sessions(token,user_id,expires_at,ip,ua) VALUES(?,?,?,?,?)",
                (token, user_id, expires, ip, ua))
     db.execute("UPDATE users SET last_login=? WHERE id=?",
@@ -227,12 +239,66 @@ def make_session_cookie(token: str, max_age: int = SESSION_DAYS * 86400) -> str:
     return f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
 
 def clear_session_cookie() -> str:
-    return f"{COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0"
+    return f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+def session_sid(token: str) -> str:
+    """Identificador público de sesión (el token real nunca sale al HTML/JSON)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+def revoke_session_by_sid(user_id: int, sid: str) -> bool:
+    db = get_db()
+    try:
+        for r in db.execute("SELECT token FROM sessions WHERE user_id=?", (user_id,)).fetchall():
+            if hmac.compare_digest(session_sid(r['token']), sid):
+                db.execute("DELETE FROM sessions WHERE token=?", (r['token'],))
+                db.commit()
+                return True
+        return False
+    finally:
+        db.close()
+
+# ── Anti fuerza bruta + login ───────────────────────────────────────────────
+_LOGIN_FAILS: dict = {}
+_LOGIN_LOCK = threading.Lock()
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW    = 300  # segundos
+
+def _login_recent(key: str) -> list:
+    now = time.time()
+    lst = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW]
+    if lst:
+        _LOGIN_FAILS[key] = lst
+    else:
+        _LOGIN_FAILS.pop(key, None)
+    return lst
+
+def authenticate(username: str, password: str, ip: str):
+    """Devuelve (user_row, error, http_status). Limita intentos y evita enumerar usuarios por tiempo."""
+    key = f"{ip}|{username}"
+    with _LOGIN_LOCK:
+        if len(_login_recent(key)) >= LOGIN_MAX_FAILS:
+            return None, 'Demasiados intentos. Espera unos minutos', 429
+    db = get_db()
+    u = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    db.close()
+    if u:
+        ok = verify_password(password, u['pw_hash'], u['pw_salt'])
+    else:
+        hash_password(password, 'pylex-dummy-salt')   # mismo coste que un usuario real
+        ok = False
+    with _LOGIN_LOCK:
+        if not ok:
+            _LOGIN_FAILS.setdefault(key, []).append(time.time())
+            return None, 'Credenciales incorrectas', 401
+        _LOGIN_FAILS.pop(key, None)
+    return u, None, 200
+
+VALID_ROLES = ('admin', 'viewer')
 
 # ── Media helpers ──────────────────────────────────────────────────────────────
 
 def make_id(path: str) -> str:
-    return hashlib.md5(path.encode()).hexdigest()
+    return hashlib.md5(path.encode(), usedforsecurity=False).hexdigest()
 
 def human_size(n: int) -> str:
     for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
@@ -262,6 +328,21 @@ def guess_media_type(path: str) -> str:
     if ext in AUDIO_EXTENSIONS: return 'audio'
     if ext in IMAGE_EXTENSIONS: return 'image'
     return 'unknown'
+
+def check_library_path(raw: str):
+    """Devuelve (ruta_real, None) o (None, mensaje_de_error)."""
+    fpath = os.path.realpath(os.path.normpath(raw))
+    if not os.path.isdir(fpath):
+        return None, f'Ruta no encontrada: {fpath}'
+    low = fpath.lower().rstrip('\\/')
+    blocked = {'', '/etc', '/bin', '/sbin', '/usr', '/boot', '/sys', '/proc',
+               '/dev', '/run', '/root', '/var', '/lib', '/lib64', '/home'}
+    prefixes = ('/etc/', '/proc/', '/sys/', '/dev/', '/boot/', '/root/', '/var/lib/',
+                '/var/log/', '/usr/bin/', '/usr/sbin/', '/usr/lib/', '/bin/', '/sbin/',
+                'c:\\windows', 'c:\\program files', 'c:\\users\\default')
+    if low in blocked or low in ('c:',) or any(low.startswith(p) for p in prefixes):
+        return None, 'Ruta de sistema no permitida'
+    return fpath, None
 
 # ── Thumbnails ─────────────────────────────────────────────────────────────────
 
@@ -307,21 +388,31 @@ def _extract_audio_art(fpath: str):
         pass
     return None
 
+_THUMB_FAIL: set = set()   # ids sin miniatura posible (evita relanzar ffmpeg en cada petición)
+
 def _extract_video_frame(fpath: str, out: str) -> bool:
     import subprocess
-    for cmd in (['ffmpeg'], ['ffmpeg.exe']):
-        try:
-            r = subprocess.run(
-                cmd + ['-y', '-ss', '00:00:05', '-i', fpath,
-                       '-vframes', '1', '-vf', 'scale=320:-2',
-                       '-q:v', '5', out],
-                capture_output=True, timeout=20
-            )
-            if os.path.isfile(out) and os.path.getsize(out) > 100:
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-    return False
+    tmp = f"{out}.{threading.get_ident()}.tmp.jpg"
+    try:
+        for exe in ('ffmpeg', 'ffmpeg.exe'):
+            for ss in ('00:00:05', '00:00:00'):      # vídeos de <5 s no generaban nada
+                try:
+                    subprocess.run(
+                        [exe, '-y', '-ss', ss, '-i', fpath, '-vframes', '1',
+                         '-vf', 'scale=320:-2', '-q:v', '5', tmp],
+                        capture_output=True, timeout=20)
+                except FileNotFoundError:
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+                if os.path.isfile(tmp) and os.path.getsize(tmp) > 100:
+                    os.replace(tmp, out)
+                    return True
+        return False
+    finally:
+        if os.path.isfile(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
 
 def get_or_make_thumb(media_id: str, fpath: str, mtype: str):
     if mtype == 'image':
@@ -329,27 +420,34 @@ def get_or_make_thumb(media_id: str, fpath: str, mtype: str):
     out = _thumb_path(media_id)
     if os.path.isfile(out) and os.path.getsize(out) > 100:
         return out
+    if media_id in _THUMB_FAIL:
+        return None
     if mtype == 'audio':
         art = _extract_audio_art(fpath)
         if art:
-            with open(out, 'wb') as f:
+            tmp = f"{out}.{threading.get_ident()}.tmp"
+            with open(tmp, 'wb') as f:
                 f.write(art)
+            os.replace(tmp, out)
             return out
     elif mtype == 'video':
         if _extract_video_frame(fpath, out):
             return out
+    _THUMB_FAIL.add(media_id)
     return None
 
 def clean_title(name: str) -> str:
-    name = re.sub(r'\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|flac|ogg|wav)$', '', name, flags=re.I)
+    original = name
     name = re.sub(r'[\._]', ' ', name)
-    name = re.sub(r'\b(19[0-9]{2}|20[0-3][0-9])\b.*', '', name)
-    name = re.sub(r'\b(1080p|720p|480p|4K|HDR|BluRay|WEB|HEVC|x264|x265|AAC|DTS)\b.*', '',
+    # corta en el año / calidad solo si hay texto antes ("2001 A Space Odyssey" se conserva)
+    name = re.sub(r'(?<=\S)\s+\(?\b(19[0-9]{2}|20[0-3][0-9])\b.*', '', name)
+    name = re.sub(r'\s+\b(1080p|720p|480p|2160p|4K|HDR|BluRay|WEB|HEVC|x264|x265|AAC|DTS)\b.*', '',
                   name, flags=re.I)
-    return name.strip().title() or name
+    name = string.capwords(name.strip())      # capwords respeta "Don't" (str.title() daba "Don'T")
+    return name or original
 
 def extract_year(name: str):
-    m = re.search(r'\b(19[0-9]{2}|20[0-3][0-9])\b', name)
+    m = re.search(r'(?<![0-9])(19[0-9]{2}|20[0-3][0-9])(?![0-9])', re.sub(r'[\._]', ' ', name))
     return int(m.group(1)) if m else None
 
 def read_audio_tags(fpath: str) -> dict:
@@ -364,6 +462,7 @@ def read_audio_tags(fpath: str) -> dict:
         def _first(key):
             v = f.get(key)
             return v[0] if v else None
+        result['title']  = _first('title')
         result['artist'] = _first('artist') or _first('albumartist')
         result['album']  = _first('album')
         result['genre']  = _first('genre')
@@ -385,13 +484,27 @@ def read_audio_tags(fpath: str) -> dict:
         pass
     return result
 
+_SCAN_LOCKS: dict = {}
+_SCAN_GUARD = threading.Lock()
+
 def scan_library(library_id: int, path: str, lib_type: str) -> int:
-    count = 0
+    with _SCAN_GUARD:
+        lock = _SCAN_LOCKS.setdefault(library_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        log.info("Biblioteca %d ya se está escaneando; se ignora", library_id)
+        return 0
+    count, conn = 0, None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=15)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
         c = conn.cursor()
-        for root, dirs, files in os.walk(path):
+        seen, pending, complete = set(), 0, True
+
+        def _walk_error(_e):
+            nonlocal complete
+            complete = False
+
+        for root, dirs, files in os.walk(path, onerror=_walk_error):
             dirs[:] = [d for d in dirs if not d.startswith('.')]
             for fname in files:
                 if Path(fname).suffix.lower() not in MEDIA_EXTENSIONS:
@@ -402,21 +515,20 @@ def scan_library(library_id: int, path: str, lib_type: str) -> int:
                     stat = os.stat(fpath)
                 except OSError:
                     continue
+                seen.add(fid)
 
-                # Read audio tags if audio file
-                tags = {}
-                if lib_type == 'music' or guess_media_type(fpath) == 'audio':
-                    tags = read_audio_tags(fpath)
+                mtype = guess_media_type(fpath)
+                tags = read_audio_tags(fpath) if (lib_type == 'music' or mtype == 'audio') else {}
+                stem = Path(fname).stem
+                title = (tags.get('title') or '').strip() or clean_title(stem)
 
                 c.execute("""
                     INSERT OR IGNORE INTO media
                     (id, library_id, title, path, type, size, year, artist, album,
                      track, genre, duration, added_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (fid, library_id,
-                      clean_title(Path(fname).stem), fpath,
-                      guess_media_type(fpath), stat.st_size,
-                      tags.get('year') or extract_year(fname),
+                """, (fid, library_id, title, fpath, mtype, stat.st_size,
+                      tags.get('year') or extract_year(stem),
                       tags.get('artist'), tags.get('album'),
                       tags.get('track'), tags.get('genre'),
                       tags.get('duration', 0),
@@ -424,14 +536,71 @@ def scan_library(library_id: int, path: str, lib_type: str) -> int:
                 c.execute("UPDATE media SET size=? WHERE id=? AND size!=?",
                           (stat.st_size, fid, stat.st_size))
                 count += 1
+                pending += 1
+                if pending >= 200:          # no mantener el bloqueo de escritura durante todo el escaneo
+                    conn.commit()
+                    pending = 0
+
+        # Eliminar entradas de ficheros que ya no existen (solo si el recorrido fue completo
+        # y encontró algo: un NAS desmontado no debe vaciar la biblioteca)
+        existing = [r[0] for r in c.execute("SELECT id FROM media WHERE library_id=?", (library_id,))]
+        gone = [i for i in existing if i not in seen]
+        if gone and complete and seen:
+            c.executemany("DELETE FROM activity_log WHERE media_id=?", [(i,) for i in gone])
+            c.executemany("DELETE FROM media WHERE id=?", [(i,) for i in gone])
+            log.info("Biblioteca %d: %d entradas huérfanas eliminadas", library_id, len(gone))
+        elif gone and not seen:
+            log.warning("Biblioteca %d: el recorrido no encontró nada; no se eliminan entradas", library_id)
+
         c.execute("UPDATE libraries SET last_scan=? WHERE id=?",
                   (datetime.now().isoformat(), library_id))
         conn.commit()
-        conn.close()
         log.info("Biblioteca %d escaneada: %d archivos encontrados", library_id, count)
     except Exception as e:
-        log.error("Error escaneando biblioteca %d: %s", library_id, e)
+        log.error("Error escaneando biblioteca %d: %s", library_id, e, exc_info=True)
+    finally:
+        if conn is not None:
+            conn.close()
+        lock.release()
     return count
+
+def record_play(user_id: int, media_id: str, progress=None, position=None):
+    """Registra reproducción/progreso. Devuelve (ok, error). El contador solo sube
+    una vez por usuario+archivo cada 30 min (antes subía en cada latido de progreso)."""
+    try:
+        prog = None
+        if progress is not None:
+            prog = float(progress)
+            if not math.isfinite(prog):
+                raise ValueError
+            prog = min(1.0, max(0.0, prog))
+        pos = float(position or 0)
+        if not math.isfinite(pos) or pos < 0:
+            pos = 0.0
+    except (TypeError, ValueError):
+        return False, 'progress/position inválidos'
+    db = get_db()
+    try:
+        if not db.execute("SELECT 1 FROM media WHERE id=?", (media_id,)).fetchone():
+            return False, 'No encontrado'
+        recent = db.execute(
+            "SELECT 1 FROM activity_log WHERE user_id=? AND media_id=? AND action='play' "
+            "AND created_at > datetime('now','-30 minutes') LIMIT 1", (user_id, media_id)).fetchone()
+        sets, params = ["last_played=?"], [datetime.now().isoformat()]
+        if not recent:
+            db.execute("INSERT INTO activity_log(user_id, media_id, action) VALUES(?,?,'play')",
+                       (user_id, media_id))
+            sets.append("play_count=play_count+1")
+        if prog is not None:
+            if prog >= 0.97:       # terminado: la próxima vez empieza desde el principio
+                pos = 0.0
+            sets.append("progress=?, position=?")
+            params += [prog, pos]
+        db.execute(f"UPDATE media SET {', '.join(sets)} WHERE id=?", params + [media_id])
+        db.commit()
+        return True, None
+    finally:
+        db.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTML / CSS base
@@ -861,12 +1030,67 @@ function toast(msg, type='info'){
   document.getElementById('toasts').appendChild(t);
   setTimeout(()=>t.remove(),3500);
 }
-const si=document.querySelector('.search-input');
-if(si) si.addEventListener('keydown',e=>{
-  if(e.key==='Enter') window.location='/search?q='+encodeURIComponent(si.value);
+// 1. Buscador adaptado a navegación suave
+document.addEventListener('keydown', e => {
+  if(e.key==='Enter' && e.target.classList.contains('search-input')) {
+    ajaxNav('/search?q='+encodeURIComponent(e.target.value));
+  }
 });
 function showModal(id){document.getElementById(id).style.display='flex'}
 function hideModal(id){document.getElementById(id).style.display='none'}
+
+// 2. Navegación AJAX (SPA) sin recargar la página para que no se corte la música
+document.addEventListener('click', e => {
+  const a = e.target.closest('a');
+  if (!a || !a.href || a.origin !== location.origin) return;
+  if (a.hasAttribute('download') || a.href.includes('/logout') || a.hasAttribute('onclick')) return;
+  e.preventDefault();
+  ajaxNav(a.href);
+});
+
+window.addEventListener('popstate', () => {
+  ajaxNav(location.href, false);
+});
+
+async function ajaxNav(url, push = true) {
+  try {
+    const resp = await fetch(url);
+    if (resp.redirected) { window.location = resp.url; return; }
+    const html = await resp.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    
+    const wasPlay = location.pathname.startsWith('/play/');
+    const isPlay = new URL(url, location.origin).pathname.startsWith('/play/');
+
+    // Sincronizar y ceder control al MiniPlayer ANTES de destruir el reproductor principal
+    if (wasPlay && !isPlay && typeof PyLexMP !== 'undefined') {
+        if(PyLexMP.syncMain) PyLexMP.syncMain();
+        if(PyLexMP.restore) PyLexMP.restore();
+    }
+
+    document.title = doc.title;
+    ['.main', '.sidebar', '.mobile-nav'].forEach(sel => {
+        const cur = document.querySelector(sel);
+        const nxt = doc.querySelector(sel);
+        if(cur && nxt) cur.innerHTML = nxt.innerHTML;
+    });
+
+    if (push) history.pushState({}, '', url);
+    window.scrollTo(0,0);
+
+    // Re-ejecutar scripts de la nueva vista
+    const scripts = document.querySelector('.main').querySelectorAll('script');
+    scripts.forEach(s => {
+      const ns = document.createElement('script');
+      if(s.src) ns.src = s.src;
+      else ns.textContent = s.textContent;
+      document.body.appendChild(ns);
+      ns.remove();
+    });
+  } catch (e) {
+    window.location = url; // Si algo falla, recarga de forma normal
+  }
+}
 """
 
 LICONS = {'movies':'🎬','shows':'📺','music':'🎵','photos':'🖼️','other':'📁'}
@@ -1093,7 +1317,7 @@ const PyLexMP = (()=>{{
 
   audio.addEventListener('ended', ()=>{{
     if(state && state.next_id){{
-      window.location = '/play/' + state.next_id;
+      typeof ajaxNav !== 'undefined' ? ajaxNav('/play/' + state.next_id) : window.location = '/play/' + state.next_id;
     }} else {{
       setPlayBtn(false);
     }}
@@ -1113,11 +1337,15 @@ const PyLexMP = (()=>{{
 
   // ── public API ────────────────────────────────────────
 
-  /**
-   * Called from a play page to register the current track.
-   * @param {{id, title, artist, album, type, position, prev_id, next_id}} data
-   * @param el  — the main <audio> or <video> element on the play page
-   */
+  function syncMain() {{
+     // Guarda el segundo exacto antes de que el navegador borre la página
+     if (mainEl && state) {{
+        state.position = mainEl.currentTime;
+        state.playing = !mainEl.paused;
+        save(state);
+     }}
+  }}
+
   function register(data, el){{
     state   = data;
     mainEl  = el;
@@ -1165,15 +1393,18 @@ const PyLexMP = (()=>{{
 
     if(d.type === 'audio'){{
       audio.muted = false;
+      const shouldPlay = state.playing !== false; // Continuar reproduciendo si estaba sonando
       if(audio.src !== location.origin + '/stream/' + d.id){{
         audio.src = '/stream/' + d.id;
         audio.addEventListener('loadedmetadata', ()=>{{
-          if(d.position > 2) audio.currentTime = d.position;
-          audio.play().catch(()=>{{}});
+          if(state.position > 0) audio.currentTime = state.position;
+          if(shouldPlay) audio.play().catch(()=>{{}});
+          else setPlayBtn(false);
         }}, {{once:true}});
-      }} else if(audio.paused){{
-        if(d.position > 2) audio.currentTime = d.position;
-        audio.play().catch(()=>{{}});
+      }} else {{
+        if(state.position > 0) audio.currentTime = state.position;
+        if(shouldPlay) audio.play().catch(()=>{{}});
+        else {{ audio.pause(); setPlayBtn(false); }}
       }}
     }} else if(d.type === 'video'){{
       // Can't resume video in mini player — just show "go back" state
@@ -1190,11 +1421,11 @@ const PyLexMP = (()=>{{
   }}
 
   function prev(){{
-    if(state && state.prev_id) window.location = '/play/' + state.prev_id;
+    if(state && state.prev_id) typeof ajaxNav !== 'undefined' ? ajaxNav('/play/' + state.prev_id) : window.location = '/play/' + state.prev_id;
   }}
 
   function next(){{
-    if(state && state.next_id) window.location = '/play/' + state.next_id;
+    if(state && state.next_id) typeof ajaxNav !== 'undefined' ? ajaxNav('/play/' + state.next_id) : window.location = '/play/' + state.next_id;
   }}
 
   function close(){{
@@ -1206,7 +1437,7 @@ const PyLexMP = (()=>{{
   }}
 
   function goToPage(){{
-    if(state && state.id) window.location = '/play/' + state.id;
+    if(state && state.id) typeof ajaxNav !== 'undefined' ? ajaxNav('/play/' + state.id) : window.location = '/play/' + state.id;
   }}
 
   function requestPiP(){{
@@ -1224,7 +1455,7 @@ const PyLexMP = (()=>{{
     restore();
   }}
 
-  return {{ register, togglePlay, prev, next, close, goToPage, requestPiP }};
+  return {{ register, togglePlay, prev, next, close, goToPage, requestPiP, restore, syncMain }};
 }})();
 </script>
 </body></html>"""
@@ -1435,7 +1666,7 @@ def page_home(user: dict) -> str:
             pct   = int((cp['progress'] or 0)*100)
             safe_ct = html_mod.escape(cp['title'])
             cards_cont += f"""
-        <div class="continue-card" onclick="window.location='/play/{cp['id']}'">
+        <div class="continue-card" onclick="typeof ajaxNav !== 'undefined' ? ajaxNav('/play/{cp['id']}') : window.location='/play/{cp['id']}'">
           <div class="continue-thumb">
             <img src="/thumb/{cp['id']}" onerror="this.remove()">{icon}
             <div class="continue-bar"><div class="continue-fill" style="width:{pct}%"></div></div>
@@ -1483,7 +1714,7 @@ def _media_card(m) -> str:
     safe_title = html_mod.escape(m['title'])
     thumb = f'<img src="/thumb/{m["id"]}" loading="lazy" class="thumb-img" onerror="this.remove()">'
     return f"""
-    <div class="media-card" onclick="window.location='/play/{m['id']}'">
+    <div class="media-card" onclick="typeof ajaxNav !== 'undefined' ? ajaxNav('/play/{m['id']}') : window.location='/play/{m['id']}'">
       <div class="media-thumb {land}">
         {thumb}
         <div class="media-thumb-icon">{icon}</div>
@@ -1511,7 +1742,7 @@ def _media_list_item(m) -> str:
     prog_bar = f'<div class="list-prog"><div class="list-prog-fill" style="width:{min(100,prog*100):.0f}%"></div></div>' if prog > 0.01 else ''
     track_html = f'<div class="list-track">{m["track"]}</div>' if m['track'] else ''
     return f"""
-    <div class="list-item" onclick="window.location='/play/{m["id"]}'">
+    <div class="list-item" onclick="typeof ajaxNav !== 'undefined' ? ajaxNav('/play/{m["id"]}') : window.location='/play/{m["id"]}'">
       <div class="list-thumb">
         <img src="/thumb/{m['id']}" onerror="this.remove()">{icon}
       </div>
@@ -1529,7 +1760,12 @@ def _empty(icon, title, text, action='') -> str:
 
 # ── Page: Library (individual) ────────────────────────────────────────────────
 
+def _js(v) -> str:
+    """json.dumps seguro para incrustar dentro de <script> (evita '</script>' en tags/títulos)."""
+    return json.dumps(v).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+
 SORT_OPTIONS = {
+    'track':      ('album COLLATE NOCASE, track, title COLLATE NOCASE', 'Pista'),
     'name':       ('title COLLATE NOCASE', 'A–Z'),
     'name_desc':  ('title COLLATE NOCASE DESC', 'Z–A'),
     'date':       ('added_at DESC', 'Recientes'),
@@ -1543,7 +1779,11 @@ SORT_OPTIONS = {
 
 def page_library(user: dict, lib_id_str: str,
                  sort: str = 'name', view: str = 'grid',
-                 group_by: str = '') -> tuple:
+                 group_by: str = '', artist: str = '', album: str = '') -> tuple:
+    if sort not in SORT_OPTIONS:
+        sort = 'name'
+    if view not in ('grid', 'list', 'artist', 'album'):
+        view = 'grid'
     try:
         lib_id = int(lib_id_str)
     except (ValueError, TypeError):
@@ -1556,8 +1796,15 @@ def page_library(user: dict, lib_id_str: str,
         return render_shell('Error', _empty('🔍', 'Biblioteca no encontrada', ''), user), 404
 
     sort_sql, _ = SORT_OPTIONS.get(sort, SORT_OPTIONS['name'])
+    where, params = "library_id=?", [lib_id]
+    if artist:
+        where += " AND COALESCE(artist,'— Desconocido —')=?"
+        params.append(artist)
+    if album:
+        where += " AND COALESCE(album,'— Sin álbum —')=?"
+        params.append(album)
     items = db.execute(
-        f"SELECT * FROM media WHERE library_id=? ORDER BY {sort_sql}", (lib_id,)
+        f"SELECT * FROM media WHERE {where} ORDER BY {sort_sql}", params
     ).fetchall()
     db.close()
 
@@ -1608,7 +1855,7 @@ def page_library(user: dict, lib_id_str: str,
             alb_cnt = len(info['albums'])
             cards += f"""
             <div class="artist-card"
-              onclick="window.location='/library/{lib_id}?sort={sort}&view=album&artist={quote(aname)}'">
+              onclick="typeof ajaxNav !== 'undefined' ? ajaxNav('/library/{lib_id}?sort={sort}&view=album&artist={quote(aname)}') : window.location='/library/{lib_id}?sort={sort}&view=album&artist={quote(aname)}'">
               <div class="artist-avatar">🎤</div>
               <div class="artist-name" title="{safe_a}">{safe_a}</div>
               <div class="artist-meta">{info['count']} canciones · {alb_cnt} álbumes</div>
@@ -1617,7 +1864,6 @@ def page_library(user: dict, lib_id_str: str,
 
     # ── Album view ──
     elif view == 'album' and is_music:
-        artist_filter = ''  # filled by query param if coming from artist view
         albums = {}
         for m in items:
             alb = m['album'] or '— Sin álbum —'
@@ -1633,7 +1879,7 @@ def page_library(user: dict, lib_id_str: str,
             safe_art = html_mod.escape(art)
             cards += f"""
             <div class="album-card"
-              onclick="window.location='/library/{lib_id}?sort=track&view=list&album={quote(alb)}'">
+              onclick="typeof ajaxNav !== 'undefined' ? ajaxNav('/library/{lib_id}?sort=track&view=list&album={quote(alb)}&artist={quote(art)}') : window.location='/library/{lib_id}?sort=track&view=list&album={quote(alb)}&artist={quote(art)}'">
               <div class="album-cover">
                 <img src="/thumb/{info['sample_id']}" onerror="this.remove()">💿
               </div>
@@ -2018,7 +2264,7 @@ def page_profile(user: dict) -> str:
             font-size:11px;color:var(--text3)">{safe_ua}</td>
           <td>{ca}</td>
           <td><button class="btn btn-ghost btn-sm"
-            onclick="revokeSession('{s['token']}')">Cerrar</button></td>
+            onclick="revokeSession('{session_sid(s['token'])}')">Cerrar</button></td>
         </tr>"""
 
     safe_display  = html_mod.escape(user['display'])
@@ -2165,6 +2411,8 @@ def page_play(user: dict, media_id: str) -> tuple:
     safe_album  = html_mod.escape(m['album'] or '')
     saved_pos  = float(m['position'] or 0)
     saved_prog = float(m['progress'] or 0)
+    if saved_prog >= 0.95:
+        saved_pos = 0.0
 
     extra_js = ''
     queue_panel = ''
@@ -2186,9 +2434,9 @@ el.addEventListener('loadedmetadata', ()=>{{
   // Register with mini player
   PyLexMP.register({{
     id:      '{media_id}',
-    title:   {json.dumps(m['title'])},
-    artist:  {json.dumps(m['artist'] or '')},
-    album:   {json.dumps(m['album'] or '')},
+    title:   {_js(m['title'])},
+    artist:  {_js(m['artist'] or '')},
+    album:   {_js(m['album'] or '')},
     type:    'video',
     position: {saved_pos},
     prev_id: {json.dumps(prev_item['id'] if prev_item else None)},
@@ -2205,7 +2453,7 @@ el.addEventListener('timeupdate', ()=>{{
 }});
 el.addEventListener('ended', ()=>{{
   const nx = '{next_url}';
-  if(nx && nx!='null') window.location=nx;
+  if(nx && nx!='null') typeof ajaxNav !== 'undefined' ? ajaxNav(nx) : window.location=nx;
 }});
 // Auto Picture-in-Picture when user navigates away
 document.addEventListener('visibilitychange', ()=>{{
@@ -2252,9 +2500,9 @@ if({saved_pos} > 2) el.addEventListener('loadedmetadata',()=>{{el.currentTime={s
 el.addEventListener('loadedmetadata', ()=>{{
   PyLexMP.register({{
     id:      '{media_id}',
-    title:   {json.dumps(m['title'])},
-    artist:  {json.dumps(m['artist'] or '')},
-    album:   {json.dumps(m['album'] or '')},
+    title:   {_js(m['title'])},
+    artist:  {_js(m['artist'] or '')},
+    album:   {_js(m['album'] or '')},
     type:    'audio',
     position: {saved_pos},
     prev_id: {json.dumps(prev_item['id'] if prev_item else None)},
@@ -2272,7 +2520,7 @@ el.addEventListener('timeupdate',()=>{{
 }});
 el.addEventListener('ended',()=>{{
   const nx='{next_url}';
-  if(nx&&nx!='null')window.location=nx;
+  if(nx&&nx!='null') typeof ajaxNav !== 'undefined' ? ajaxNav(nx) : window.location=nx;
 }});"""
 
     elif m['type'] == 'image':
@@ -2315,7 +2563,7 @@ function advanceSS(){{
     const cur='{media_id}';
     const idx=IMG_IDS.indexOf(cur);
     const nxt=IMG_IDS[(idx+1)%IMG_IDS.length];
-    window.location='/play/'+nxt;
+    typeof ajaxNav !== 'undefined' ? ajaxNav('/play/'+nxt) : window.location='/play/'+nxt;
   }},spd);
 }}
 const img=document.getElementById('slide-img');
@@ -2375,8 +2623,8 @@ fetch('/api/play/{media_id}',{{method:'POST',headers:{{'Content-Type':'applicati
             <span class="tag">{m['type'].capitalize()}</span>
             <span class="tag">{human_size(m['size'] or 0)}</span>
             <span class="tag">{ext}</span>
-            {f'<span class="tag">{html_mod.escape(safe_artist)}</span>' if safe_artist else ''}
-            {f'<span class="tag">💿 {html_mod.escape(safe_album)}</span>' if safe_album else ''}
+            {f'<span class="tag">{safe_artist}</span>' if safe_artist else ''}
+            {f'<span class="tag">💿 {safe_album}</span>' if safe_album else ''}
           </div>
           {prog_info}
           <div style="font-size:12px;color:var(--text3);word-break:break-all;margin-top:10px">📁 {safe_path}</div>
@@ -2395,6 +2643,9 @@ fetch('/api/play/{media_id}',{{method:'POST',headers:{{'Content-Type':'applicati
 
 def page_search(user: dict, query: str, filter_type: str = '',
                 filter_year: str = '', filter_lib: str = '') -> str:
+    filter_type = filter_type if filter_type in ('video', 'audio', 'image') else ''
+    filter_year = filter_year if filter_year.isdigit() else ''
+    filter_lib  = filter_lib  if filter_lib.isdigit()  else ''
     if not query:
         return render_shell('Búsqueda', f"""
     <div class="topbar">
@@ -2473,11 +2724,11 @@ def page_search(user: dict, query: str, filter_type: str = '',
       {type_filters}
       <span class="sep">|</span>
       <select class="form-select" style="width:auto;padding:5px 10px;font-size:12px"
-        onchange="location='/search?q={quote(query)}&type={filter_type}&year='+this.value+'&lib={filter_lib}'">
+        onchange="typeof ajaxNav !== 'undefined' ? ajaxNav('/search?q={quote(query)}&type={filter_type}&year='+this.value+'&lib={filter_lib}') : location='/search?q={quote(query)}&type={filter_type}&year='+this.value+'&lib={filter_lib}'">
         {year_options}
       </select>
       <select class="form-select" style="width:auto;padding:5px 10px;font-size:12px"
-        onchange="location='/search?q={quote(query)}&type={filter_type}&year={filter_year}&lib='+this.value">
+        onchange="typeof ajaxNav !== 'undefined' ? ajaxNav('/search?q={quote(query)}&type={filter_type}&year={filter_year}&lib='+this.value) : location='/search?q={quote(query)}&type={filter_type}&year={filter_year}&lib='+this.value">
         {lib_options}
       </select>
     </div>"""
@@ -2623,15 +2874,23 @@ function delLib(id, name) {
 
 # ── Auto-scan worker ────────────────────────────────────────────────────────────
 
-def _auto_scan_worker(interval_hours: int):
-    """Daemon thread: re-scans all libraries every interval_hours hours."""
-    log.info("Auto-scan activado cada %d horas", interval_hours)
+def _auto_scan_worker(_interval_hours=None):
+    """Hilo daemon: reescanea las bibliotecas según el ajuste 'auto_scan_hours' (0 = desactivado).
+    El valor se relee de la BD, así que cambiarlo en Ajustes surte efecto sin reiniciar."""
+    log.info("Auto-scan activo (intervalo configurable en Ajustes)")
+    last_run = time.time()
     while True:
-        time.sleep(interval_hours * 3600)
+        time.sleep(60)
         try:
             db = get_db()
+            row = db.execute("SELECT value FROM settings WHERE key='auto_scan_hours'").fetchone()
+            hours = int(row['value']) if row and str(row['value']).isdigit() else AUTO_SCAN_HOURS
+            if hours <= 0 or time.time() - last_run < hours * 3600:
+                db.close()
+                continue
             libs = db.execute("SELECT id, path, type FROM libraries").fetchall()
             db.close()
+            last_run = time.time()
             for lib in libs:
                 log.info("Auto-scan biblioteca %d: %s", lib['id'], lib['path'])
                 scan_library(lib['id'], lib['path'], lib['type'])
@@ -2640,11 +2899,17 @@ def _auto_scan_worker(interval_hours: int):
 
 
 class PyLexHandler(BaseHTTPRequestHandler):
+    timeout = 300   # (el 'timeout' del servidor no afectaba a las conexiones)
+
     def log_message(self, fmt, *args):
-        method = self.command if hasattr(self, 'command') else '?'
-        if method in ('POST', 'DELETE', 'PUT') or (args and str(args[1]) >= '400'):
-            log.info("[%s] %s %s %s", self.client_address[0], method,
-                     self.path, args[1] if len(args) > 1 else '')
+        method = getattr(self, 'command', '?')
+        status = args[1] if len(args) > 1 else ''
+        try:
+            is_err = int(status) >= 400
+        except (TypeError, ValueError):
+            is_err = False
+        if method in ('POST', 'DELETE', 'PUT') or is_err:
+            log.info("[%s] %s %s %s", self.client_address[0], method, self.path, status)
 
     def get_token(self) -> str:
         return parse_cookie(self.headers.get('Cookie', '')).get(COOKIE_NAME, '')
@@ -2657,6 +2922,9 @@ class PyLexHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'same-origin')
         for h, v in (extra_headers or []):
             self.send_header(h, v)
         self.end_headers()
@@ -2742,7 +3010,9 @@ class PyLexHandler(BaseHTTPRequestHandler):
             elif path.startswith('/library/'):
                 sort = qs.get('sort', ['name'])[0]
                 view = qs.get('view', ['grid'])[0]
-                html, status = page_library(user, path[9:], sort=sort, view=view)
+                html, status = page_library(user, path[9:], sort=sort, view=view,
+                                            artist=qs.get('artist', [''])[0],
+                                            album=qs.get('album', [''])[0])
                 self.send_html(html, status)
             elif path == '/libraries':
                 if user['role'] != 'admin':
@@ -2841,16 +3111,14 @@ class PyLexHandler(BaseHTTPRequestHandler):
             return
 
         if path == '/api/login':
-            un = body.get('username', '').strip().lower()
-            pw = body.get('password', '')
-            db = get_db()
-            u  = db.execute("SELECT * FROM users WHERE username=?", (un,)).fetchone()
-            db.close()
-            if not u or not verify_password(pw, u['pw_hash'], u['pw_salt']):
-                self.send_json({'ok': False, 'error': 'Credenciales incorrectas'})
+            un = str(body.get('username', '')).strip().lower()
+            pw = str(body.get('password', ''))
+            u, err, st = authenticate(un, pw, self.get_ip())
+            if err:
+                self.send_json({'ok': False, 'error': err}, st)
                 return
-            token = create_session(u['id'], self.get_ip(), self.headers.get('User-Agent', ''))
             days  = SESSION_DAYS if body.get('remember') else 1
+            token = create_session(u['id'], self.get_ip(), self.headers.get('User-Agent', ''), days)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Set-Cookie', make_session_cookie(token, days * 86400))
@@ -2874,24 +3142,11 @@ class PyLexHandler(BaseHTTPRequestHandler):
                 if not name or not fpath:
                     self.send_json({'ok': False, 'error': 'Faltan datos'}); return
 
-                fpath = os.path.normpath(fpath)
-                fpath = os.path.realpath(fpath)
-
-                if not os.path.isdir(fpath):
-                    self.send_json({'ok': False, 'error': f'Ruta no encontrada: {fpath}'}); return
-
-                fpath_lower = fpath.lower()
-                BLOCKED = {'/', '/etc', '/bin', '/sbin', '/usr', '/usr/bin',
-                           '/usr/sbin', '/boot', '/sys', '/proc', '/dev', '/run'}
-                BLOCKED_PREFIXES_UNIX = ('/etc/', '/proc/', '/sys/', '/dev/')
-                BLOCKED_PREFIXES_WIN  = ('c:\\windows', 'c:\\program files', 'c:\\users\\default')
-                is_blocked = (
-                    fpath in BLOCKED
-                    or any(fpath.startswith(p) for p in BLOCKED_PREFIXES_UNIX)
-                    or any(fpath_lower.startswith(p) for p in BLOCKED_PREFIXES_WIN)
-                )
-                if is_blocked:
-                    self.send_json({'ok': False, 'error': 'Ruta de sistema no permitida'}); return
+                fpath, perr = check_library_path(fpath)
+                if perr:
+                    self.send_json({'ok': False, 'error': perr}); return
+                if ltype not in ('movies', 'shows', 'music', 'photos', 'other'):
+                    ltype = 'other'
 
                 db = get_db()
                 c  = db.cursor()
@@ -2923,6 +3178,8 @@ class PyLexHandler(BaseHTTPRequestHandler):
                 av   = body.get('avatar', '👤')
                 if not un or not dis or len(pw) < 8:
                     self.send_json({'ok': False, 'error': 'Datos insuficientes'}); return
+                if role not in VALID_ROLES:
+                    self.send_json({'ok': False, 'error': 'Rol inválido'}); return
                 h, s = hash_password(pw)
                 db = get_db()
                 try:
@@ -2938,6 +3195,8 @@ class PyLexHandler(BaseHTTPRequestHandler):
                 if not self.require_admin(user): return
                 uid  = int(path.split('/')[3])
                 role = body.get('role', 'viewer')
+                if role not in VALID_ROLES:
+                    self.send_json({'ok': False, 'error': 'Rol inválido'}); return
                 if uid == user['id']:
                     self.send_json({'ok': False, 'error': 'No puedes cambiar tu propio rol'}); return
                 db = get_db()
@@ -2946,22 +3205,10 @@ class PyLexHandler(BaseHTTPRequestHandler):
                 self.send_json({'ok': True})
 
             elif path.startswith('/api/play/'):
-                mid      = path[10:]
-                progress = body.get('progress')
-                position = body.get('position')
-                db  = get_db()
-                if progress is not None:
-                    db.execute("""UPDATE media SET play_count=play_count+1,
-                        last_played=?, progress=?, position=? WHERE id=?""",
-                        (datetime.now().isoformat(), float(progress),
-                         float(position or 0), mid))
-                else:
-                    db.execute("UPDATE media SET play_count=play_count+1, last_played=? WHERE id=?",
-                               (datetime.now().isoformat(), mid))
-                db.execute("INSERT INTO activity_log(user_id, media_id, action) VALUES(?,?,?)",
-                           (user['id'], mid, 'play'))
-                db.commit(); db.close()
-                self.send_json({'ok': True})
+                ok, perr = record_play(user['id'], path[10:],
+                                       body.get('progress'), body.get('position'))
+                self.send_json({'ok': ok, **({'error': perr} if perr else {})},
+                               200 if ok else (404 if perr == 'No encontrado' else 400))
 
             elif path == '/api/profile':
                 dis = body.get('display', '').strip()
@@ -2986,13 +3233,17 @@ class PyLexHandler(BaseHTTPRequestHandler):
                     self.send_json({'ok': False, 'error': 'Mínimo 8 caracteres'}); return
                 h, s = hash_password(new)
                 db.execute("UPDATE users SET pw_hash=?, pw_salt=? WHERE id=?", (h, s, user['id']))
+                db.execute("DELETE FROM sessions WHERE user_id=? AND token!=?", (user['id'], self.get_token()))
                 db.commit(); db.close()
                 self.send_json({'ok': True})
 
             elif path == '/api/settings':
                 if not self.require_admin(user): return
-                sn = body.get('server_name', '').strip()
-                asc = body.get('auto_scan_hours', '').strip()
+                sn = str(body.get('server_name', '')).strip()[:80]
+                asc = str(body.get('auto_scan_hours', '')).strip()
+                if asc:
+                    if not asc.isdigit() or not (0 <= int(asc) <= 168):
+                        self.send_json({'ok': False, 'error': 'auto_scan_hours debe ser 0-168'}); return
                 db = get_db()
                 if sn:
                     db.execute("INSERT OR REPLACE INTO settings VALUES('server_name',?)", (sn,))
@@ -3020,6 +3271,7 @@ class PyLexHandler(BaseHTTPRequestHandler):
                 if not self.require_admin(user): return
                 lid = int(path[15:])
                 db  = get_db()
+                db.execute("DELETE FROM activity_log WHERE media_id IN (SELECT id FROM media WHERE library_id=?)", (lid,))
                 db.execute("DELETE FROM media WHERE library_id=?", (lid,))
                 db.execute("DELETE FROM libraries WHERE id=?", (lid,))
                 db.commit(); db.close()
@@ -3032,17 +3284,13 @@ class PyLexHandler(BaseHTTPRequestHandler):
                     self.send_json({'ok': False, 'error': 'No puedes eliminarte a ti mismo'}); return
                 db = get_db()
                 db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+                db.execute("DELETE FROM activity_log WHERE user_id=?", (uid,))
                 db.execute("DELETE FROM users WHERE id=?", (uid,))
                 db.commit(); db.close()
                 self.send_json({'ok': True})
 
             elif path.startswith('/api/sessions/') and path != '/api/sessions':
-                token = path[14:]
-                db = get_db()
-                s  = db.execute("SELECT user_id FROM sessions WHERE token=?", (token,)).fetchone()
-                db.close()
-                if s and s['user_id'] == user['id']:
-                    revoke_session(token)
+                if revoke_session_by_sid(user['id'], path[14:]):
                     self.send_json({'ok': True})
                 else:
                     self.send_json({'ok': False, 'error': 'No autorizado'}, 403)
@@ -3087,7 +3335,7 @@ class PyLexHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(fsize))
-        self.send_header('Cache-Control', 'public, max-age=86400')
+        self.send_header('Cache-Control', 'private, max-age=86400')
         self.end_headers()
         try:
             with open(thumb, 'rb') as f:
@@ -3122,13 +3370,28 @@ class PyLexHandler(BaseHTTPRequestHandler):
         try:
             if rh:
                 try:
-                    parts = rh.replace('bytes=', '').split('-')
-                    start = int(parts[0]) if parts[0] else 0
-                    end   = int(parts[1]) if parts[1] else fsize - 1
+                    spec = rh.strip().lower()
+                    if not spec.startswith('bytes=') or ',' in spec:
+                        raise ValueError
+                    a, b = spec[6:].split('-', 1)
+                    if a == '':                       # sufijo: "bytes=-N" = últimos N bytes
+                        n = int(b)
+                        if n <= 0:
+                            raise ValueError
+                        start, end = max(0, fsize - n), fsize - 1
+                    else:
+                        start = int(a)
+                        end   = int(b) if b else fsize - 1
                 except (ValueError, IndexError):
-                    self.send_response(416); self.end_headers(); return
+                    self.send_response(416)
+                    self.send_header('Content-Range', f'bytes */{fsize}')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers(); return
                 if start < 0 or start >= fsize or end < start:
-                    self.send_response(416); self.end_headers(); return
+                    self.send_response(416)
+                    self.send_header('Content-Range', f'bytes */{fsize}')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers(); return
                 end    = min(end, fsize - 1)
                 length = end - start + 1
                 self.send_response(206)
@@ -3228,11 +3491,9 @@ def get_local_ip() -> str:
             pass
     return 'localhost'
 
-import socketserver
-
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    timeout = 300
+    request_queue_size = 64
 
 def confirm_ip(detected_ip: str) -> str:
     SEP = "═"*52
@@ -3260,12 +3521,12 @@ def confirm_ip(detected_ip: str) -> str:
 
         print(f"  IP detectada automáticamente: \033[1;33m{detected_ip}\033[0m")
         if len(usable) > 1:
-            print(f"  Otras IPs disponibles:")
+            print("  Otras IPs disponibles:")
             for ip in usable:
                 marker = "  ◀ (seleccionada)" if ip == detected_ip else ""
                 print(f"    · {ip}{marker}")
         print()
-        print(f"  Los dispositivos de tu red podrán acceder en:")
+        print("  Los dispositivos de tu red podrán acceder en:")
         print(f"  \033[1;36mhttp://{detected_ip}:{PORT}\033[0m")
         print()
 
@@ -3330,12 +3591,12 @@ def main():
     if ip != 'localhost':
         print(f"  Red:     \033[1;36mhttp://{ip}:{PORT}\033[0m")
     else:
-        print(f"  Red:     (sin IP de red — solo acceso local)")
+        print("  Red:     (sin IP de red — solo acceso local)")
     if db_existed:
         status = "✅ migrada" if migrated_ok else "⚠️  ERROR DE MIGRACIÓN"
         print(f"  BD:      pylex.db existente — {status}")
     else:
-        print(f"  BD:      pylex.db creada nueva")
+        print("  BD:      pylex.db creada nueva")
     if setup:
         print("  ⚠️  Primera ejecución: crea tu cuenta admin")
     print(SEP)
@@ -3343,19 +3604,8 @@ def main():
     print("  Presiona Ctrl+C para detener")
     print(SEP + "\n")
 
-    # ── Auto-scan thread ────────────────────────────────────────────────────────
-    try:
-        db = get_db()
-        asrow = db.execute("SELECT value FROM settings WHERE key='auto_scan_hours'").fetchone()
-        db.close()
-        auto_h = int(asrow['value']) if asrow else AUTO_SCAN_HOURS
-    except Exception:
-        auto_h = AUTO_SCAN_HOURS
-
-    if auto_h > 0:
-        t = threading.Thread(target=_auto_scan_worker, args=(auto_h,), daemon=True)
-        t.start()
-        log.info("Auto-scan thread started (every %d hours)", auto_h)
+    # ── Auto-scan thread (el intervalo se lee de la BD en cada vuelta) ──────────
+    threading.Thread(target=_auto_scan_worker, daemon=True).start()
 
     server = ThreadedHTTPServer(('0.0.0.0', PORT), PyLexHandler)
     try:
